@@ -255,11 +255,14 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Este comando es solo para Luis y Vero.")
         return
     t = calcular_totales()
+    ahorrado_total = sum(t["fondos"].values())
+    balance_disponible = t["balance"] - ahorrado_total
     msg = (
         f"📊 *Resumen*\n"
         f"Ingresos: {fmt(t['ingresos'])}\n"
         f"Egresos: {fmt(t['egresos'])}\n"
-        f"Balance: {fmt(t['balance'])}\n\n"
+        f"Ahorrado (separado): {fmt(ahorrado_total)}\n"
+        f"Balance disponible: {fmt(balance_disponible)}\n\n"
         f"💰 *Ahorros*\n"
         f"Fondo de Emergencia: {fmt(t['fondos']['Fondo de Emergencia'])}\n"
         f"Jubilación: {fmt(t['fondos']['Jubilación'])}\n"
