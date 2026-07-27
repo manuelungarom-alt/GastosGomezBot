@@ -224,6 +224,15 @@ def fmt(n: float) -> str:
 # ---------------------------------------------------------------------------
 # Handlers de Telegram
 # ---------------------------------------------------------------------------
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    users = load_users()
+    if chat_id in users:
+        del users[chat_id]
+        save_users(users)
+    await start(update, context)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     users = load_users()
@@ -324,6 +333,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(CommandHandler("total", total_cmd))
     application.add_handler(CallbackQueryHandler(register_callback, pattern=r"^reg:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
