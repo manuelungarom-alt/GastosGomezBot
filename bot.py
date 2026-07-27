@@ -59,7 +59,8 @@ def load_users() -> dict:
     try:
         _, res = dbx.files_download(USERS_PATH)
         return json.loads(res.content.decode("utf-8"))
-    except dropbox.exceptions.ApiError:
+    except Exception as e:
+        log.warning(f"No se pudo leer {USERS_PATH} (puede ser normal si aun no existe): {e}")
         return {}
 
 
