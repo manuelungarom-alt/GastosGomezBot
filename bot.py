@@ -26,7 +26,9 @@ log = logging.getLogger("bot_familia")
 # Config (todo esto viene de variables de entorno, nunca hardcodeado)
 # ---------------------------------------------------------------------------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-DROPBOX_TOKEN = os.environ["DROPBOX_TOKEN"]
+DROPBOX_REFRESH_TOKEN = os.environ["DROPBOX_REFRESH_TOKEN"]
+DROPBOX_APP_KEY = os.environ["DROPBOX_APP_KEY"]
+DROPBOX_APP_SECRET = os.environ["DROPBOX_APP_SECRET"]
 EXCEL_PATH = os.environ.get("EXCEL_PATH", "/Gastos_Familia_v3.xlsx")
 USERS_PATH = os.environ.get("USERS_PATH", "/usuarios.json")
 
@@ -50,7 +52,11 @@ MEDIOS = {
 RETIRO_WORDS = ["retiro", "retiré", "retire", "saque", "saqué", "saco"]
 INGRESO_WORDS = ["ingreso", "ingresé", "ingrese", "cobre", "cobré", "cobro"]
 
-dbx = dropbox.Dropbox(DROPBOX_TOKEN)
+dbx = dropbox.Dropbox(
+    oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
+    app_key=DROPBOX_APP_KEY,
+    app_secret=DROPBOX_APP_SECRET,
+)
 
 # ---------------------------------------------------------------------------
 # Dropbox helpers
