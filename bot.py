@@ -2,13 +2,11 @@ import os
 import re
 import json
 import logging
-import threading
 from io import BytesIO
 from datetime import datetime
 
 import openpyxl
 import dropbox
-from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -315,32 +313,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Flask keep-alive (Render free tier necesita un puerto HTTP abierto)
+# Arranque en modo webhook (Telegram nos avisa a nosotros, en vez de que
+# nosotros le preguntemos todo el tiempo). Esto es clave para el plan free
+# de Render: un pedido HTTP entrante es lo unico que puede "despertar" al
+# servicio si estaba dormido por inactividad.
 # ---------------------------------------------------------------------------
-flask_app = Flask(__name__)
-
-
-@flask_app.route("/")
-def home():
-    return "Bot familia OK"
-
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
-
-
 def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("total", total_cmd))
     application.add_handler(CallbackQueryHandler(register_callback, pattern=r"^reg:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    log.info("Bot arrancado, escuchando mensajes...")
-    application.run_polling()
+    port = int(os.environ.get("PORT", 10000))
+    webhook_base = os.environ["WEBHOOK_URL"].rstrip("/")
+
+    log.info("Bot arrancado en modo webhook...")
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TELEGRAM_TOKEN,
+        webhook_url=f"{webhook_base}/{TELEGRAM_TOKEN}",
+    )
 
 
 if __name__ == "__main__":
