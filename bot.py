@@ -103,7 +103,7 @@ def first_empty_row(ws, start=3, col=1) -> int:
 def parse_message(text: str) -> dict | None:
     text_low = text.lower()
 
-    m = re.search(r"(\d{1,3}(?:[.,]\d{3})+|\d+)", text)
+    m = re.search(r"\$?\s*(\d{1,3}(?:[.,]\d{3})+|\d+)", text)
     if not m:
         return None
     monto_str = m.group(1).replace(".", "").replace(",", "")
@@ -122,13 +122,21 @@ def parse_message(text: str) -> dict | None:
     is_ingreso = any(w in text_low for w in INGRESO_WORDS)
 
     medio = "Transferencia"  # default razonable si no lo especifican
+    medio_encontrado = None
     for k, v in MEDIOS.items():
         if k in text_low:
             medio = v
+            medio_encontrado = k
             break
 
-    # Motivo: el mensaje original, sacando el monto encontrado
-    motivo = text.replace(m.group(0), "").strip(" ,.-")
+    # Motivo: el mensaje original, sacando el monto y las palabras clave usadas
+    motivo = text.replace(m.group(0), "")
+    palabras_a_sacar = list(FONDOS.keys()) + RETIRO_WORDS + INGRESO_WORDS
+    if medio_encontrado:
+        palabras_a_sacar.append(medio_encontrado)
+    for palabra in palabras_a_sacar:
+        motivo = re.sub(rf"\b{re.escape(palabra)}\b", "", motivo, flags=re.IGNORECASE)
+    motivo = re.sub(r"\s+", " ", motivo).strip(" ,.-")
     if not motivo:
         motivo = "Sin descripción"
 
