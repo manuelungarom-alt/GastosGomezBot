@@ -43,10 +43,13 @@ FONDOS = {
 
 MEDIOS = {
     "efectivo": "Efectivo",
-    "debito": "Débito",
-    "débito": "Débito",
-    "transferencia": "Transferencia",
+    "mercado pago": "Mercado Pago",
+    "mercadopago": "Mercado Pago",
+    "mp": "Mercado Pago",
+    "galicia": "Galicia",
+    "santander": "Santander",
 }
+LUGARES = ["Efectivo", "Mercado Pago", "Galicia", "Santander"]
 
 RETIRO_WORDS = ["retiro", "retiré", "retire", "saque", "saqué", "saco"]
 INGRESO_WORDS = ["ingreso", "ingresé", "ingrese", "cobre", "cobré", "cobro"]
@@ -145,7 +148,7 @@ def parse_message(text: str) -> dict | None:
     is_retiro = any(w in text_low_sa for w in RETIRO_WORDS)
     is_ingreso = any(w in text_low_sa for w in INGRESO_WORDS)
 
-    medio = "Transferencia"  # default razonable si no lo especifican
+    medio = "Sin especificar"  # si no dicen el lugar, no se cuenta en la diversificación
     medio_encontrado = None
     for k, v in MEDIOS.items():
         if k in text_low:
@@ -208,20 +211,69 @@ def registrar_ahorro(nombre: str, fondo: str, tipo: str, monto: float):
     upload_excel(wb)
 
 
+MESES_ES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+
+
+def parse_mes_input(texto: str) -> str | None:
+    """Convierte 'agosto' o 'agosto2026' en 'YYYY-MM'."""
+    texto_sa = quitar_acentos(texto.strip().lower())
+    m = re.match(r"([a-z]+)\s*(\d{4})?", texto_sa)
+    if not m:
+        return None
+    nombre_mes, anio_str = m.group(1), m.group(2)
+    mes_num = MESES_ES.get(nombre_mes)
+    if not mes_num:
+        return None
+    if anio_str:
+        anio = int(anio_str)
+    else:
+        hoy = datetime.now()
+        anio = hoy.year if mes_num >= hoy.month else hoy.year + 1
+    return f"{anio:04d}-{mes_num:02d}"
+
+
+def calcular_totales_mes(mes_sheet: str) -> dict:
+    wb = download_excel()
+    ws = wb["Movimientos"]
+    ingresos = egresos = 0.0
+    r = 3
+    while ws.cell(row=r, column=1).value not in (None, ""):
+        fecha = ws.cell(row=r, column=1).value
+        if fecha and fecha.strftime("%Y-%m") == mes_sheet:
+            tipo = ws.cell(row=r, column=2).value
+            monto = ws.cell(row=r, column=3).value or 0
+            if tipo == "Ingreso":
+                ingresos += monto
+            elif tipo == "Egreso":
+                egresos += monto
+        r += 1
+    return {"ingresos": ingresos, "egresos": egresos, "balance": ingresos - egresos}
+
+
 def calcular_totales() -> dict:
     """Recalcula a mano (no depende de la cache de formulas de Excel)."""
     wb = download_excel()
 
     ws = wb["Movimientos"]
     ingresos = egresos = 0.0
+    lugares_total = {l: 0.0 for l in LUGARES}
     r = 3
     while ws.cell(row=r, column=1).value not in (None, ""):
         tipo = ws.cell(row=r, column=2).value
         monto = ws.cell(row=r, column=3).value or 0
+        medio = ws.cell(row=r, column=5).value
         if tipo == "Ingreso":
             ingresos += monto
+            if medio in lugares_total:
+                lugares_total[medio] += monto
         elif tipo == "Egreso":
             egresos += monto
+            if medio in lugares_total:
+                lugares_total[medio] -= monto
         r += 1
 
     wsd = wb["Ahorro_Detalle"]
@@ -240,6 +292,7 @@ def calcular_totales() -> dict:
         "egresos": egresos,
         "balance": ingresos - egresos,
         "fondos": fondos_total,
+        "lugares": lugares_total,
     }
 
 
@@ -289,6 +342,27 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if nombre not in ADMIN_NAMES:
         await update.message.reply_text("Este comando es solo para Luis y Vero.")
         return
+
+    texto_comando = update.message.text.split()[0][1:]  # sin la barra "/"
+    sufijo = texto_comando[len("total"):].strip()
+
+    if sufijo:
+        mes_sheet = parse_mes_input(sufijo)
+        if not mes_sheet:
+            await update.message.reply_text(
+                f"No entendí el mes '{sufijo}'. Probá '/totalagosto' o '/totalagosto2026'."
+            )
+            return
+        tm = calcular_totales_mes(mes_sheet)
+        msg = (
+            f"📊 *{mes_sheet}*\n"
+            f"Ingresos: {fmt(tm['ingresos'])}\n"
+            f"Egresos: {fmt(tm['egresos'])}\n"
+            f"Balance del mes: {fmt(tm['balance'])}\n"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
     t = calcular_totales()
     ahorrado_total = sum(t["fondos"].values())
     balance_disponible = t["balance"] - ahorrado_total
@@ -298,6 +372,11 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Egresos: {fmt(t['egresos'])}\n"
         f"Ahorrado (separado): {fmt(ahorrado_total)}\n"
         f"Balance disponible: {fmt(balance_disponible)}\n\n"
+        f"📍 *Dónde está la plata*\n"
+        f"Efectivo: {fmt(t['lugares']['Efectivo'])}\n"
+        f"Mercado Pago: {fmt(t['lugares']['Mercado Pago'])}\n"
+        f"Galicia: {fmt(t['lugares']['Galicia'])}\n"
+        f"Santander: {fmt(t['lugares']['Santander'])}\n\n"
         f"💰 *Ahorros*\n"
         f"Fondo de Emergencia: {fmt(t['fondos']['Fondo de Emergencia'])}\n"
         f"Jubilación: {fmt(t['fondos']['Jubilación'])}\n"
@@ -319,7 +398,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_message(text)
     if not parsed:
         await update.message.reply_text(
-            "No pude entender el monto. Probá algo como: '50.000 comida transferencia'"
+            "No reconocí ese mensaje como un gasto/ingreso. Probá algo como: '50.000 comida transferencia'"
         )
         return
 
@@ -360,7 +439,7 @@ def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reset", reset_cmd))
-    application.add_handler(CommandHandler("total", total_cmd))
+    application.add_handler(MessageHandler(filters.Regex(r"^/total") & filters.COMMAND, total_cmd))
     application.add_handler(CallbackQueryHandler(register_callback, pattern=r"^reg:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
