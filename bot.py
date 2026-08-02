@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import unicodedata
 from io import BytesIO
 from datetime import datetime
 
@@ -98,26 +99,51 @@ def first_empty_row(ws, start=3, col=1) -> int:
 # ---------------------------------------------------------------------------
 # Parseo del mensaje
 # ---------------------------------------------------------------------------
+ACCENT_MAP = {"a": "[aá]", "e": "[eé]", "i": "[ií]", "o": "[oó]", "u": "[uúü]"}
+
+
+def patron_sin_acentos(palabra: str) -> str:
+    return "".join(ACCENT_MAP.get(c, re.escape(c)) for c in palabra)
+
+
+def quitar_acentos(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn"
+    )
+
+
+def parse_monto(s: str) -> float:
+    """Interpreta '50.000' (miles) o '2479054,80' (decimales) correctamente."""
+    partes = re.split(r"[.,]", s)
+    if len(partes) == 1:
+        return float(partes[0])
+    ultima = partes[-1]
+    if len(ultima) in (1, 2):
+        entero = "".join(partes[:-1])
+        return float(f"{entero}.{ultima}")
+    return float("".join(partes))
+
+
 def parse_message(text: str) -> dict | None:
     text_low = text.lower()
+    text_low_sa = quitar_acentos(text_low)
 
-    m = re.search(r"\$?\s*(\d{1,3}(?:[.,]\d{3})+|\d+)", text)
+    m = re.search(r"\$?\s*(\d+(?:[.,]\d{3})*(?:[.,]\d{1,2})?)", text)
     if not m:
         return None
-    monto_str = m.group(1).replace(".", "").replace(",", "")
     try:
-        monto = float(monto_str)
+        monto = parse_monto(m.group(1))
     except ValueError:
         return None
 
     fondo = None
     for k, v in FONDOS.items():
-        if k in text_low:
+        if k in text_low_sa:
             fondo = v
             break
 
-    is_retiro = any(w in text_low for w in RETIRO_WORDS)
-    is_ingreso = any(w in text_low for w in INGRESO_WORDS)
+    is_retiro = any(w in text_low_sa for w in RETIRO_WORDS)
+    is_ingreso = any(w in text_low_sa for w in INGRESO_WORDS)
 
     medio = "Transferencia"  # default razonable si no lo especifican
     medio_encontrado = None
@@ -133,7 +159,7 @@ def parse_message(text: str) -> dict | None:
     if medio_encontrado:
         palabras_a_sacar.append(medio_encontrado)
     for palabra in palabras_a_sacar:
-        motivo = re.sub(rf"\b{re.escape(palabra)}\b", "", motivo, flags=re.IGNORECASE)
+        motivo = re.sub(rf"\b{patron_sin_acentos(palabra)}\b", "", motivo, flags=re.IGNORECASE)
     motivo = re.sub(r"\s+", " ", motivo).strip(" ,.-")
     if not motivo:
         motivo = "Sin descripción"
