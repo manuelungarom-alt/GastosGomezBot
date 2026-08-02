@@ -266,6 +266,29 @@ def calcular_totales_mes(mes_sheet: str) -> dict:
     return {"ingresos": ingresos, "egresos": egresos, "balance": ingresos - egresos}
 
 
+def mes_sheet_name(dt: datetime) -> str:
+    return dt.strftime("%Y-%m")
+
+
+def calcular_gasto_persona_mes(nombre_persona: str, mes_sheet: str) -> float:
+    wb = download_excel()
+    ws = wb["Movimientos"]
+    total = 0.0
+    r = 3
+    while ws.cell(row=r, column=1).value not in (None, ""):
+        fecha = ws.cell(row=r, column=1).value
+        tipo = ws.cell(row=r, column=2).value
+        persona = ws.cell(row=r, column=6).value
+        if (
+            fecha and fecha.strftime("%Y-%m") == mes_sheet
+            and tipo == "Egreso"
+            and persona == nombre_persona
+        ):
+            total += ws.cell(row=r, column=3).value or 0
+        r += 1
+    return total
+
+
 def calcular_totales() -> dict:
     """Recalcula a mano (no depende de la cache de formulas de Excel)."""
     wb = download_excel()
@@ -360,19 +383,34 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sufijo:
         mes_sheet = parse_mes_input(sufijo)
-        if not mes_sheet:
+        if mes_sheet:
+            tm = calcular_totales_mes(mes_sheet)
+            msg = (
+                f"📊 *{mes_sheet}*\n"
+                f"Ingresos: {fmt(tm['ingresos'])}\n"
+                f"Egresos: {fmt(tm['egresos'])}\n"
+                f"Balance del mes: {fmt(tm['balance'])}\n"
+            )
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        sufijo_norm = quitar_acentos(sufijo.lower())
+        persona_encontrada = None
+        for persona in ALL_NAMES:
+            if quitar_acentos(persona.lower()) == sufijo_norm:
+                persona_encontrada = persona
+                break
+        if persona_encontrada:
+            mes_actual = mes_sheet_name(datetime.now())
+            gasto = calcular_gasto_persona_mes(persona_encontrada, mes_actual)
             await update.message.reply_text(
-                f"No entendí el mes '{sufijo}'. Probá '/totalagosto' o '/totalagosto2026'."
+                f"{persona_encontrada} gastó {fmt(gasto)} en {mes_actual}"
             )
             return
-        tm = calcular_totales_mes(mes_sheet)
-        msg = (
-            f"📊 *{mes_sheet}*\n"
-            f"Ingresos: {fmt(tm['ingresos'])}\n"
-            f"Egresos: {fmt(tm['egresos'])}\n"
-            f"Balance del mes: {fmt(tm['balance'])}\n"
+
+        await update.message.reply_text(
+            f"No entendí '{sufijo}'. Probá '/totalagosto' (un mes) o '/total{sufijo.lower()}' con el nombre de alguien de la familia."
         )
-        await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
     t = calcular_totales()
