@@ -14,6 +14,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
@@ -32,6 +33,7 @@ EXCEL_PATH = os.environ.get("EXCEL_PATH", "/Gastos_Familia_v3.xlsx")
 USERS_PATH = os.environ.get("USERS_PATH", "/usuarios.json")
 
 ADMIN_NAMES = ["Luis", "Vero"]
+PUEDE_CREDITO = ["Luis", "Vero", "Malena"]
 ALL_NAMES = ["Luis", "Vero", "Malena", "Luka", "Mateo"]
 
 FONDOS = {
@@ -53,6 +55,13 @@ LUGARES = ["Efectivo", "Mercado Pago", "Galicia", "Santander"]
 
 RETIRO_WORDS = ["retiro", "retiré", "retire", "saque", "saqué", "saco"]
 INGRESO_WORDS = ["ingreso", "ingresé", "ingrese", "cobre", "cobré", "cobro"]
+CREDITO_WORDS = ["credito", "crédito"]
+
+TARJETAS = ["Visa", "American"]
+BANCOS = ["Galicia", "Santander"]
+
+# Estados de la conversacion de credito
+TARJETA, BANCO, CUOTAS, MES = range(4)
 
 dbx = dropbox.Dropbox(
     oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
@@ -147,6 +156,7 @@ def parse_message(text: str) -> dict | None:
 
     is_retiro = any(w in text_low_sa for w in RETIRO_WORDS)
     is_ingreso = any(w in text_low_sa for w in INGRESO_WORDS)
+    is_credito = any(w in text_low_sa for w in CREDITO_WORDS)
 
     medio = "Sin especificar"  # si no dicen el lugar, no se cuenta en la diversificación
     medio_encontrado = None
@@ -158,7 +168,7 @@ def parse_message(text: str) -> dict | None:
 
     # Motivo: el mensaje original, sacando el monto y las palabras clave usadas
     motivo = text.replace(m.group(0), "")
-    palabras_a_sacar = list(FONDOS.keys()) + RETIRO_WORDS + INGRESO_WORDS
+    palabras_a_sacar = list(FONDOS.keys()) + RETIRO_WORDS + INGRESO_WORDS + CREDITO_WORDS
     if medio_encontrado:
         palabras_a_sacar.append(medio_encontrado)
     for palabra in palabras_a_sacar:
@@ -172,6 +182,7 @@ def parse_message(text: str) -> dict | None:
         "fondo": fondo,
         "is_retiro": is_retiro,
         "is_ingreso": is_ingreso,
+        "is_credito": is_credito,
         "medio": medio,
         "motivo": motivo,
     }
@@ -180,11 +191,12 @@ def parse_message(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Escritura en Excel
 # ---------------------------------------------------------------------------
-def registrar_movimiento(nombre: str, tipo: str, monto: float, motivo: str, medio: str):
+def registrar_movimiento(nombre: str, tipo: str, monto: float, motivo: str, medio: str, fecha_override: datetime = None):
     wb = download_excel()
     ws = wb["Movimientos"]
     r = first_empty_row(ws, start=3, col=1)
-    ws.cell(row=r, column=1, value=datetime.now())
+    fecha = fecha_override or datetime.now()
+    ws.cell(row=r, column=1, value=fecha)
     ws.cell(row=r, column=1).number_format = "DD/MM/YYYY"
     ws.cell(row=r, column=2, value=tipo)
     ws.cell(row=r, column=3, value=monto)
@@ -392,7 +404,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not nombre:
         await update.message.reply_text("Antes que nada, decime quién sos con /start")
-        return
+        return ConversationHandler.END
 
     text = update.message.text or ""
     parsed = parse_message(text)
@@ -400,9 +412,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "No reconocí ese mensaje como un gasto/ingreso. Probá algo como: '50.000 comida transferencia'"
         )
-        return
+        return ConversationHandler.END
 
     es_admin = nombre in ADMIN_NAMES
+
+    # --- Credito (Luis, Vero, Malena; solo gastos) ---
+    if parsed["is_credito"] and not parsed["is_ingreso"] and not parsed["fondo"] and nombre in PUEDE_CREDITO:
+        context.user_data["pendiente"] = {
+            "nombre": nombre,
+            "monto": parsed["monto"],
+            "motivo": parsed["motivo"],
+        }
+        buttons = [[InlineKeyboardButton(t, callback_data=f"tarjeta:{t}")] for t in TARJETAS]
+        await update.message.reply_text(
+            "¿Qué tarjeta usaste?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return TARJETA
 
     # --- Ahorro (solo admins) ---
     if parsed["fondo"] and es_admin:
@@ -411,13 +436,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Listo ✅ {tipo} de {fmt(parsed['monto'])} en {parsed['fondo']}"
         )
-        return
+        return ConversationHandler.END
 
     # --- Ingreso (solo admins) ---
     if parsed["is_ingreso"] and es_admin:
         registrar_movimiento(nombre, "Ingreso", parsed["monto"], parsed["motivo"], parsed["medio"])
         await update.message.reply_text(f"Listo ✅ Ingreso de {fmt(parsed['monto'])} anotado")
-        return
+        return ConversationHandler.END
 
     # --- Egreso normal (todos) ---
     registrar_movimiento(nombre, "Egreso", parsed["monto"], parsed["motivo"], parsed["medio"])
@@ -427,6 +452,87 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("Listo, anotado ✅")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Conversacion de credito: tarjeta -> banco -> cuotas -> mes
+# ---------------------------------------------------------------------------
+def sumar_meses(mes_sheet: str, n: int) -> str:
+    anio, mes = map(int, mes_sheet.split("-"))
+    total = (anio * 12 + (mes - 1)) + n
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
+async def tarjeta_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    tarjeta = query.data.split(":")[1]
+    context.user_data["pendiente"]["tarjeta"] = tarjeta
+    await query.answer()
+    buttons = [[InlineKeyboardButton(b, callback_data=f"banco:{b}")] for b in BANCOS]
+    await query.edit_message_text(f"Tarjeta: {tarjeta}\n¿De qué banco?")
+    await query.message.reply_text("Elegí el banco:", reply_markup=InlineKeyboardMarkup(buttons))
+    return BANCO
+
+
+async def banco_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    banco = query.data.split(":")[1]
+    context.user_data["pendiente"]["banco"] = banco
+    await query.answer()
+    await query.edit_message_text(f"Banco: {banco}\n¿Cuántas cuotas? (escribí el número)")
+    return CUOTAS
+
+
+async def cuotas_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text.strip()
+    if not texto.isdigit() or int(texto) < 1:
+        await update.message.reply_text("Escribí un número válido de cuotas (ej. 1, 3, 12).")
+        return CUOTAS
+    context.user_data["pendiente"]["cuotas"] = int(texto)
+    await update.message.reply_text(
+        "¿En qué mes empieza a cobrarse la primera cuota? (ej. 'agosto' o 'agosto 2026')"
+    )
+    return MES
+
+
+async def mes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text.strip()
+    mes_sheet = parse_mes_input(texto)
+    if not mes_sheet:
+        await update.message.reply_text("No entendí el mes. Escribilo así: 'agosto' o 'agosto 2026'.")
+        return MES
+
+    pend = context.user_data.get("pendiente")
+    if not pend:
+        await update.message.reply_text("Se perdió el gasto en curso, probá de nuevo desde cero.")
+        return ConversationHandler.END
+
+    cuotas = pend["cuotas"]
+    monto_total = pend["monto"]
+    monto_cuota = round(monto_total / cuotas)
+    diferencia = monto_total - monto_cuota * cuotas
+
+    for i in range(cuotas):
+        monto_i = monto_cuota + (diferencia if i == cuotas - 1 else 0)
+        mes_i = sumar_meses(mes_sheet, i)
+        anio_i, mes_num_i = map(int, mes_i.split("-"))
+        fecha_i = datetime(anio_i, mes_num_i, 1)
+        motivo_i = f"{pend['motivo']} ({pend['tarjeta']}, cuota {i + 1}/{cuotas})"
+        registrar_movimiento(pend["nombre"], "Egreso", monto_i, motivo_i, pend["banco"], fecha_override=fecha_i)
+
+    await update.message.reply_text(
+        f"Listo ✅ {fmt(monto_total)} en {cuotas} cuota(s) de {fmt(monto_cuota)}, "
+        f"empezando en {mes_sheet} ({pend['tarjeta']} {pend['banco']})"
+    )
+    context.user_data.pop("pendiente", None)
+    return ConversationHandler.END
+
+
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("pendiente", None)
+    await update.message.reply_text("Cancelado.")
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -437,11 +543,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
+        states={
+            TARJETA: [CallbackQueryHandler(tarjeta_callback, pattern=r"^tarjeta:")],
+            BANCO: [CallbackQueryHandler(banco_callback, pattern=r"^banco:")],
+            CUOTAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, cuotas_handler)],
+            MES: [MessageHandler(filters.TEXT & ~filters.COMMAND, mes_handler)],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reset", reset_cmd))
     application.add_handler(MessageHandler(filters.Regex(r"^/total") & filters.COMMAND, total_cmd))
     application.add_handler(CallbackQueryHandler(register_callback, pattern=r"^reg:"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(conv_handler)
 
     port = int(os.environ.get("PORT", 10000))
     webhook_base = os.environ["WEBHOOK_URL"].rstrip("/")
