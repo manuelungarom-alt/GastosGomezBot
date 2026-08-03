@@ -75,7 +75,7 @@ TARJETAS = ["Visa", "American"]
 BANCOS = ["Galicia", "Santander"]
 
 # Estados de la conversacion de credito
-TARJETA, BANCO, CUOTAS, MES, MEDIO_SELECT, TRANSFER_ORIGEN = range(6)
+TARJETA, BANCO, CUOTAS, MES, MEDIO_SELECT, TRANSFER_ORIGEN, MOTIVO_INPUT, TIPO_SELECT, LUGAR_INGRESO_SELECT = range(9)
 
 dbx = dropbox.Dropbox(
     oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
@@ -510,39 +510,100 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    # --- Mensaje ambiguo: solo el monto, nada mas. Preguntar tipo antes de asumir ---
+    if (
+        parsed["motivo"] == "Sin descripción"
+        and not parsed["medio_detectado"]
+        and not parsed["is_ingreso"]
+        and es_admin
+    ):
+        context.user_data["pendiente"] = {"nombre": nombre, "monto": parsed["monto"], "es_admin": es_admin}
+        buttons = [[
+            InlineKeyboardButton("Ingreso", callback_data="tiposel:Ingreso"),
+            InlineKeyboardButton("Egreso", callback_data="tiposel:Egreso"),
+        ]]
+        await update.message.reply_text(
+            "¿Ingreso o egreso?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return TIPO_SELECT
+
     # --- Ingreso (solo admins) ---
     if parsed["is_ingreso"] and es_admin:
-        if not parsed["medio_detectado"]:
-            context.user_data["pendiente"] = {
-                "nombre": nombre, "monto": parsed["monto"], "motivo": parsed["motivo"],
-                "tipo": "Ingreso",
-            }
-            return await preguntar_medio(update, context)
-        registrar_movimiento(nombre, "Ingreso", parsed["monto"], parsed["motivo"], parsed["medio"])
-        await update.message.reply_text(f"Listo ✅ Ingreso de {fmt(parsed['monto'])} anotado")
-        return ConversationHandler.END
-
-    # --- Egreso normal (todos) ---
-    if not parsed["medio_detectado"]:
         context.user_data["pendiente"] = {
             "nombre": nombre, "monto": parsed["monto"], "motivo": parsed["motivo"],
-            "tipo": "Egreso", "es_admin": es_admin,
+            "tipo": "Ingreso", "medio": parsed["medio"], "medio_detectado": parsed["medio_detectado"],
         }
-        return await preguntar_medio(update, context)
+        if parsed["motivo"] == "Sin descripción":
+            return await preguntar_motivo(update, context)
+        if not parsed["medio_detectado"]:
+            return await preguntar_medio(update, context)
+        return await finalizar_ingreso_egreso(update, context)
 
-    registrar_movimiento(nombre, "Egreso", parsed["monto"], parsed["motivo"], parsed["medio"])
-    if es_admin:
-        await update.message.reply_text(
-            f"Listo ✅ Gasto de {fmt(parsed['monto'])} en {parsed['motivo']} ({parsed['medio']})"
-        )
-    else:
-        await update.message.reply_text("Listo, anotado ✅")
-    return ConversationHandler.END
+    # --- Egreso normal (todos) ---
+    context.user_data["pendiente"] = {
+        "nombre": nombre, "monto": parsed["monto"], "motivo": parsed["motivo"],
+        "tipo": "Egreso", "medio": parsed["medio"], "medio_detectado": parsed["medio_detectado"],
+        "es_admin": es_admin,
+    }
+    if parsed["motivo"] == "Sin descripción":
+        return await preguntar_motivo(update, context)
+    if not parsed["medio_detectado"]:
+        return await preguntar_medio(update, context)
+    return await finalizar_ingreso_egreso(update, context)
 
 
 # ---------------------------------------------------------------------------
 # Pregunta de medio de pago: Transferencia -> (de donde) / Efectivo / Credito
 # ---------------------------------------------------------------------------
+async def tipo_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    tipo = query.data.split(":", 1)[1]
+    await query.answer()
+    pend = context.user_data["pendiente"]
+    pend["tipo"] = tipo
+
+    if tipo == "Ingreso":
+        await query.edit_message_text("Tipo: Ingreso")
+        buttons = [[InlineKeyboardButton(l, callback_data=f"lugaringreso:{l}")] for l in LUGARES]
+        await query.message.reply_text(
+            "¿En qué lugar ingresó?", reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return LUGAR_INGRESO_SELECT
+
+    pend["motivo"] = "Sin descripción"
+    pend["medio_detectado"] = False
+    await query.edit_message_text("Tipo: Egreso")
+    return await preguntar_motivo(update, context)
+
+
+async def lugar_ingreso_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    lugar = query.data.split(":", 1)[1]
+    await query.answer()
+    pend = context.user_data["pendiente"]
+    pend["medio"] = lugar
+    pend["motivo"] = "Sin descripción"
+    await query.edit_message_text(f"Ingresó en: {lugar}")
+    return await finalizar_ingreso_egreso(update, context)
+
+
+async def preguntar_motivo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("¿En qué fue?")
+    return MOTIVO_INPUT
+
+
+async def motivo_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text.strip()
+    if not texto:
+        await update.message.reply_text("Contame en qué fue, por favor.")
+        return MOTIVO_INPUT
+    pend = context.user_data["pendiente"]
+    pend["motivo"] = texto
+    if not pend["medio_detectado"]:
+        return await preguntar_medio(update, context)
+    return await finalizar_ingreso_egreso(update, context)
+
+
 async def preguntar_medio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pend = context.user_data["pendiente"]
     opciones = ["Transferencia", "Efectivo"]
@@ -695,6 +756,9 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
         states={
+            TIPO_SELECT: [CallbackQueryHandler(tipo_select_callback, pattern=r"^tiposel:")],
+            LUGAR_INGRESO_SELECT: [CallbackQueryHandler(lugar_ingreso_callback, pattern=r"^lugaringreso:")],
+            MOTIVO_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, motivo_input_handler)],
             MEDIO_SELECT: [CallbackQueryHandler(medio_select_callback, pattern=r"^mediosel:")],
             TRANSFER_ORIGEN: [CallbackQueryHandler(transfer_origen_callback, pattern=r"^transorigen:")],
             TARJETA: [CallbackQueryHandler(tarjeta_callback, pattern=r"^tarjeta:")],
