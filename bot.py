@@ -607,7 +607,7 @@ async def motivo_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def preguntar_medio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pend = context.user_data["pendiente"]
     opciones = ["Transferencia", "Efectivo"]
-    if pend["tipo"] == "Egreso":
+    if pend["tipo"] == "Egreso" and pend["nombre"] in PUEDE_CREDITO:
         opciones.append("Crédito")
     buttons = [[InlineKeyboardButton(o, callback_data=f"mediosel:{o}")] for o in opciones]
     await update.effective_message.reply_text(
