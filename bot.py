@@ -606,9 +606,13 @@ async def motivo_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def preguntar_medio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pend = context.user_data["pendiente"]
-    opciones = ["Transferencia", "Efectivo"]
-    if pend["tipo"] == "Egreso" and pend["nombre"] in PUEDE_CREDITO:
-        opciones.append("Crédito")
+    if pend["nombre"] in PUEDE_CREDITO:
+        opciones = ["Transferencia", "Efectivo"]
+        if pend["tipo"] == "Egreso":
+            opciones.append("Crédito")
+    else:
+        # Mateo y Luka: solo estas 2 opciones, sin submenu de banco
+        opciones = ["Efectivo", "Mercado Pago"]
     buttons = [[InlineKeyboardButton(o, callback_data=f"mediosel:{o}")] for o in opciones]
     await update.effective_message.reply_text(
         "¿Medio de pago?", reply_markup=InlineKeyboardMarkup(buttons)
@@ -634,9 +638,9 @@ async def medio_select_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("¿Qué tarjeta usaste?", reply_markup=InlineKeyboardMarkup(buttons))
         return TARJETA
 
-    # Efectivo
-    pend["medio"] = "Efectivo"
-    await query.edit_message_text("Medio: Efectivo")
+    # Efectivo o Mercado Pago (elegido directo, sin pasar por el submenu de banco)
+    pend["medio"] = opcion
+    await query.edit_message_text(f"Medio: {opcion}")
     return await finalizar_ingreso_egreso(update, context)
 
 
