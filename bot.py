@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import unicodedata
+import difflib
 from io import BytesIO
 from datetime import datetime
 
@@ -52,16 +53,29 @@ MEDIOS = {
     "santander": "Santander",
 }
 LUGARES = ["Efectivo", "Mercado Pago", "Galicia", "Santander"]
+LUGARES_TRANSFERENCIA = ["Mercado Pago", "Galicia", "Santander"]
 
 RETIRO_WORDS = ["retiro", "retiré", "retire", "saque", "saqué", "saco"]
 INGRESO_WORDS = ["ingreso", "ingresé", "ingrese", "cobre", "cobré", "cobro"]
 CREDITO_WORDS = ["credito", "crédito"]
+PALABRAS_CLAVE = RETIRO_WORDS + INGRESO_WORDS + CREDITO_WORDS + list(FONDOS.keys())
+
+
+def detectar_palabra_sospechosa(texto_sa: str) -> str | None:
+    """Si hay una palabra parecida a una clave (ingreso/retiro/etc) pero mal escrita, la devuelve."""
+    for palabra in re.findall(r"[a-záéíóúñ]+", texto_sa):
+        if palabra in PALABRAS_CLAVE or len(palabra) < 4:
+            continue
+        match = difflib.get_close_matches(palabra, PALABRAS_CLAVE, n=1, cutoff=0.8)
+        if match:
+            return match[0]
+    return None
 
 TARJETAS = ["Visa", "American"]
 BANCOS = ["Galicia", "Santander"]
 
 # Estados de la conversacion de credito
-TARJETA, BANCO, CUOTAS, MES = range(4)
+TARJETA, BANCO, CUOTAS, MES, MEDIO_SELECT, TRANSFER_ORIGEN = range(6)
 
 dbx = dropbox.Dropbox(
     oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
@@ -158,6 +172,10 @@ def parse_message(text: str) -> dict | None:
     is_ingreso = any(w in text_low_sa for w in INGRESO_WORDS)
     is_credito = any(w in text_low_sa for w in CREDITO_WORDS)
 
+    palabra_sospechosa = None
+    if not (is_retiro or is_ingreso or is_credito or fondo):
+        palabra_sospechosa = detectar_palabra_sospechosa(text_low_sa)
+
     medio = "Sin especificar"  # si no dicen el lugar, no se cuenta en la diversificación
     medio_encontrado = None
     for k, v in MEDIOS.items():
@@ -183,7 +201,9 @@ def parse_message(text: str) -> dict | None:
         "is_retiro": is_retiro,
         "is_ingreso": is_ingreso,
         "is_credito": is_credito,
+        "palabra_sospechosa": palabra_sospechosa,
         "medio": medio,
+        "medio_detectado": medio_encontrado is not None,
         "motivo": motivo,
     }
 
@@ -296,6 +316,7 @@ def calcular_totales() -> dict:
     ws = wb["Movimientos"]
     ingresos = egresos = 0.0
     lugares_total = {l: 0.0 for l in LUGARES}
+    sin_especificar = 0.0
     r = 3
     while ws.cell(row=r, column=1).value not in (None, ""):
         tipo = ws.cell(row=r, column=2).value
@@ -305,10 +326,14 @@ def calcular_totales() -> dict:
             ingresos += monto
             if medio in lugares_total:
                 lugares_total[medio] += monto
+            else:
+                sin_especificar += monto
         elif tipo == "Egreso":
             egresos += monto
             if medio in lugares_total:
                 lugares_total[medio] -= monto
+            else:
+                sin_especificar -= monto
         r += 1
 
     wsd = wb["Ahorro_Detalle"]
@@ -328,6 +353,7 @@ def calcular_totales() -> dict:
         "balance": ingresos - egresos,
         "fondos": fondos_total,
         "lugares": lugares_total,
+        "sin_especificar": sin_especificar,
     }
 
 
@@ -426,7 +452,8 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Efectivo: {fmt(t['lugares']['Efectivo'])}\n"
         f"Mercado Pago: {fmt(t['lugares']['Mercado Pago'])}\n"
         f"Galicia: {fmt(t['lugares']['Galicia'])}\n"
-        f"Santander: {fmt(t['lugares']['Santander'])}\n\n"
+        f"Santander: {fmt(t['lugares']['Santander'])}\n"
+        f"Sin especificar: {fmt(t['sin_especificar'])}\n\n"
         f"💰 *Ahorros*\n"
         f"Fondo de Emergencia: {fmt(t['fondos']['Fondo de Emergencia'])}\n"
         f"Jubilación: {fmt(t['fondos']['Jubilación'])}\n"
@@ -449,6 +476,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not parsed:
         await update.message.reply_text(
             "No reconocí ese mensaje como un gasto/ingreso. Probá algo como: '50.000 comida transferencia'"
+        )
+        return ConversationHandler.END
+
+    if parsed["palabra_sospechosa"]:
+        await update.message.reply_text(
+            f"⚠️ No entendí bien tu mensaje — ¿quisiste decir '{parsed['palabra_sospechosa']}'? "
+            f"No cargué nada, revisá cómo lo escribiste y mandalo de nuevo."
         )
         return ConversationHandler.END
 
@@ -478,11 +512,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Ingreso (solo admins) ---
     if parsed["is_ingreso"] and es_admin:
+        if not parsed["medio_detectado"]:
+            context.user_data["pendiente"] = {
+                "nombre": nombre, "monto": parsed["monto"], "motivo": parsed["motivo"],
+                "tipo": "Ingreso",
+            }
+            return await preguntar_medio(update, context)
         registrar_movimiento(nombre, "Ingreso", parsed["monto"], parsed["motivo"], parsed["medio"])
         await update.message.reply_text(f"Listo ✅ Ingreso de {fmt(parsed['monto'])} anotado")
         return ConversationHandler.END
 
     # --- Egreso normal (todos) ---
+    if not parsed["medio_detectado"]:
+        context.user_data["pendiente"] = {
+            "nombre": nombre, "monto": parsed["monto"], "motivo": parsed["motivo"],
+            "tipo": "Egreso", "es_admin": es_admin,
+        }
+        return await preguntar_medio(update, context)
+
     registrar_movimiento(nombre, "Egreso", parsed["monto"], parsed["motivo"], parsed["medio"])
     if es_admin:
         await update.message.reply_text(
@@ -490,6 +537,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("Listo, anotado ✅")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Pregunta de medio de pago: Transferencia -> (de donde) / Efectivo / Credito
+# ---------------------------------------------------------------------------
+async def preguntar_medio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pend = context.user_data["pendiente"]
+    opciones = ["Transferencia", "Efectivo"]
+    if pend["tipo"] == "Egreso":
+        opciones.append("Crédito")
+    buttons = [[InlineKeyboardButton(o, callback_data=f"mediosel:{o}")] for o in opciones]
+    await update.effective_message.reply_text(
+        "¿Medio de pago?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return MEDIO_SELECT
+
+
+async def medio_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    opcion = query.data.split(":", 1)[1]
+    await query.answer()
+    pend = context.user_data["pendiente"]
+
+    if opcion == "Transferencia":
+        await query.edit_message_text("Transferencia\n¿De dónde?")
+        buttons = [[InlineKeyboardButton(b, callback_data=f"transorigen:{b}")] for b in LUGARES_TRANSFERENCIA]
+        await query.message.reply_text("Elegí de dónde:", reply_markup=InlineKeyboardMarkup(buttons))
+        return TRANSFER_ORIGEN
+
+    if opcion == "Crédito":
+        await query.edit_message_text("Medio: Crédito")
+        buttons = [[InlineKeyboardButton(t, callback_data=f"tarjeta:{t}")] for t in TARJETAS]
+        await query.message.reply_text("¿Qué tarjeta usaste?", reply_markup=InlineKeyboardMarkup(buttons))
+        return TARJETA
+
+    # Efectivo
+    pend["medio"] = "Efectivo"
+    await query.edit_message_text("Medio: Efectivo")
+    return await finalizar_ingreso_egreso(update, context)
+
+
+async def transfer_origen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    lugar = query.data.split(":", 1)[1]
+    await query.answer()
+    context.user_data["pendiente"]["medio"] = lugar
+    await query.edit_message_text(f"Transferencia desde: {lugar}")
+    return await finalizar_ingreso_egreso(update, context)
+
+
+async def finalizar_ingreso_egreso(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pend = context.user_data["pendiente"]
+    registrar_movimiento(pend["nombre"], pend["tipo"], pend["monto"], pend["motivo"], pend["medio"])
+    if pend["tipo"] == "Ingreso":
+        await update.effective_message.reply_text(f"Listo ✅ Ingreso de {fmt(pend['monto'])} anotado")
+    elif pend.get("es_admin", True):
+        await update.effective_message.reply_text(
+            f"Listo ✅ Gasto de {fmt(pend['monto'])} en {pend['motivo']} ({pend['medio']})"
+        )
+    else:
+        await update.effective_message.reply_text("Listo, anotado ✅")
+    context.user_data.pop("pendiente", None)
     return ConversationHandler.END
 
 
@@ -585,6 +695,8 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)],
         states={
+            MEDIO_SELECT: [CallbackQueryHandler(medio_select_callback, pattern=r"^mediosel:")],
+            TRANSFER_ORIGEN: [CallbackQueryHandler(transfer_origen_callback, pattern=r"^transorigen:")],
             TARJETA: [CallbackQueryHandler(tarjeta_callback, pattern=r"^tarjeta:")],
             BANCO: [CallbackQueryHandler(banco_callback, pattern=r"^banco:")],
             CUOTAS: [MessageHandler(filters.TEXT & ~filters.COMMAND, cuotas_handler)],
